@@ -13,7 +13,7 @@ from e3nn.util.jit import compile_mode
 
 from mace.data import AtomicData
 from mace.modules.radial import ZBLBasis
-from mace.tools.scatter import scatter_sum
+from mace.tools.scatter import scatter_sum, scatter_mean, scatter_std
 
 from .blocks import (
     AtomicEnergiesBlock,
@@ -142,7 +142,7 @@ class MACE(torch.nn.Module):
         self.readouts = torch.nn.ModuleList()
         self.readouts.append(
             LinearReadoutBlock(
-                hidden_irreps, o3.Irreps(f"{len(heads)}x0e"), cueq_config
+                hidden_irreps, o3.Irreps(f"{256}x0e"), cueq_config
             )
         )
 
@@ -178,19 +178,37 @@ class MACE(torch.nn.Module):
                 self.readouts.append(
                     NonLinearReadoutBlock(
                         hidden_irreps_out,
-                        (len(heads) * MLP_irreps).simplify(),
+                        (256 * MLP_irreps).simplify(),
                         gate,
-                        o3.Irreps(f"{len(heads)}x0e"),
-                        len(heads),
+                        o3.Irreps(f"{256}x0e"),
+                        256,
                         cueq_config,
                     )
                 )
             else:
                 self.readouts.append(
                     LinearReadoutBlock(
-                        hidden_irreps, o3.Irreps(f"{len(heads)}x0e"), cueq_config
+                        hidden_irreps, o3.Irreps(f"{256}x0e"), cueq_config
                     )
                 )
+
+        input_dim = self.node_embedding.linear.irreps_out.num_irreps
+        self.mom_mapper = torch.nn.Sequential(
+            torch.nn.Linear(3, 1),
+            torch.nn.GELU(),
+        )
+
+        mid_dim = MLP_irreps.num_irreps
+
+        self.mom_attn = torch.nn.MultiheadAttention(
+            input_dim, 8, 0.05, batch_first=True
+        )
+
+        self.fc = torch.nn.Sequential(
+            torch.nn.Linear(input_dim, mid_dim),
+            torch.nn.GELU(),
+            torch.nn.Linear(mid_dim, 1),
+        )
 
     def forward(
         self,
@@ -420,26 +438,65 @@ class ScaleShiftMACE(MACE):
                 node_feats=node_feats, sc=sc, node_attrs=data["node_attrs"]
             )
             node_feats_list.append(node_feats)
+            # breakpoint()
             node_es_list.append(
-                readout(node_feats, node_heads)[num_atoms_arange, node_heads]
+                readout(node_feats, node_heads)
+                # readout(node_feats, node_heads)[num_atoms_arange, node_heads]
             )  # {[n_nodes, ], }
 
         # Concatenate node features
         node_feats_out = torch.cat(node_feats_list, dim=-1)
         # Sum over interactions
-        node_inter_es = torch.sum(
-            torch.stack(node_es_list, dim=0), dim=0
-        )  # [n_nodes, ]
-        node_inter_es = self.scale_shift(node_inter_es, node_heads)
+        node_inter_es = node_es_list[1] # [n_nodes, 16]
+        node_inter_es = self.scale_shift(
+            node_inter_es,
+            torch.zeros(node_es_list[0].shape[0], 256).long()
+        )
 
         # Sum over nodes in graph
-        inter_e = scatter_sum(
-            src=node_inter_es, index=data["batch"], dim=-1, dim_size=num_graphs
-        )  # [n_graphs,]
+        # inter_e = scatter_sum(
+        #     src=node_inter_es, index=data["batch"], dim=-1, dim_size=num_graphs
+        # )  # [n_graphs,]
+
+        # node_energies = self.readouts[0](node_feats)[0]  # [n_nodes, 16]
+        node_energies = node_es_list[0]
+
+        inter_e = scatter_mean(
+                src=node_inter_es,
+                index=data["batch"].unsqueeze(-1),
+                dim=0,
+                dim_size=num_graphs,
+                )  # [n_graphs,16]
+
+        inter_std = scatter_std(
+                src=node_inter_es,
+                index=data["batch"].unsqueeze(-1),
+                dim=0,
+                dim_size=num_graphs,
+                )  # [n_graphs,16]
+
+        inter_sum = scatter_sum(
+                src=node_inter_es,
+                index=data["batch"].unsqueeze(-1),
+                dim=0,
+                dim_size=num_graphs,
+                )  # [n_graphs,256]
+
+        inter_e = inter_e[:, :, None]
+        inter_std = inter_std[:, :, None]
+        inter_sum = inter_sum[:, :, None]
+
+        momentums = self.mom_mapper(torch.cat([inter_e, inter_std, inter_sum], dim=2))
+        momentums = momentums.reshape(momentums.shape[0], 1, momentums.shape[1])
+        att_momentums, _ = self.mom_attn(momentums, momentums, momentums)
+        momentums = momentums + att_momentums
+        momentums = momentums[:, 0, :]
+
+        output_quantity = self.fc(momentums)
 
         # Add E_0 and (scaled) interaction energy
-        total_energy = e0 + inter_e
-        node_energy = node_e0 + node_inter_es
+        total_energy = e0 + output_quantity.reshape(-1)
+        node_energy = node_e0 # + node_inter_es
         forces, virials, stress, hessian = get_outputs(
             energy=inter_e,
             positions=data["positions"],
